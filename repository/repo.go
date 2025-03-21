@@ -337,7 +337,7 @@ func (r Repo) GetRecordsByMultiPrimaryKeys(ctx context.Context, columns []dtos.C
 	keysStr := strings.Join(lo.Map(keys, func(key dtos.PrimaryKey, index int) string { return key.ColumnName }), ", ")
 
 	rows, err := config.Db.Query(ctx,
-		fmt.Sprintf("SELECT %s FROM %s.%s WHERE (%s) > (%s) AND (%s) < (%s) ORDER BY %s",
+		fmt.Sprintf("SELECT %s FROM %s.%s WHERE (%s) >= (%s) AND (%s) <= (%s) ORDER BY %s",
 			columnList, tableSchema, tableName, keysStr, rhsValuePlaceHolder1Str, keysStr, rhsValuePlaceHolder2Str, keysStr), value1...)
 	if err != nil {
 		log.Printf("Failed to fetch records by multi primary keys: %v", err)
