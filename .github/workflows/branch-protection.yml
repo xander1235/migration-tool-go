@@ -1,0 +1,25 @@
+name: Branch Protection Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-branch-protection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if user has permission
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            if [[ "${{ github.actor }}" != "xander1235" ]]; then
+              echo "Direct push to main branch is not allowed except for maintainers"
+              exit 1
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            if [[ "${{ github.actor }}" != "xander1235" ]]; then
+              echo "Only maintainers can merge to main branch"
+              exit 1
+            fi
+          fi

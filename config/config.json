@@ -1,0 +1,72 @@
+{
+  "source": {
+    "type": "postgres",
+    "value": {
+      "connection_details": {
+        "host": "postgres-example-host.region.rds.amazonaws.com",
+        "port": "5432",
+        "username": "postgres_user",
+        "password": "example_password",
+        "database": "example_database"
+      },
+      "configuration": {
+        "schemas": [
+          "raw_input",
+          "optimization"
+        ],
+        "excluded_schemas": [
+          "public"
+        ],
+        "exclude_table_regex_list": [
+          {
+            "schema": "raw_input",
+            "regex": ["\\bdjango_\\w*"]
+          }
+        ],
+        "exclude_tables_list": [
+          {
+            "schema": "raw_input",
+            "tables": [
+              "example_table_1",
+              "example_table_2"
+            ]
+          }
+        ],
+        "pool": 20
+      }
+    }
+  },
+  "destination": {
+    "type": "doris",
+    "value": {
+      "connection_details": {
+        "fe_nodes": "doris-fe-example.region.amazonaws.com",
+        "fe_port": 8030,
+        "be_nodes": "doris-be-example.region.amazonaws.com",
+        "be_port": 8040,
+        "username": "doris_user",
+        "password": "example_password",
+        "database": "example_doris_db"
+      },
+      "configuration": {
+        "pool": 20
+      }
+    }
+  },
+  "worker_configuration": {
+    "no_of_workers": 20,
+    "worker_batch_size": 10000,
+    "id_batch_size": 100000,
+    "record_batch_size": 5000,
+    "batch_processing_timeout_ms": 500,
+    "concurrent_tables": 1
+  },
+  "stats_configuration": {
+    "enabled": true,
+    "interval_seconds": 30,
+    "output_file": "report.csv"
+  },
+  "tracking_configuration": {
+    "progress_ticker": "30 secs"
+  }
+}

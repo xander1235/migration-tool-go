@@ -1,0 +1,13 @@
+# Exclude JetBrains IDE files
+.idea/
+
+# Exclude logs content but keep the directory
+logs/*
+!logs/.gitkeep
+
+# Exclude CSV files
+*.csv
+
+# Common exclusions
+*.log
+.DS_Store
