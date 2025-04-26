@@ -7,12 +7,14 @@ import (
 	"log"
 	"migration-tool-go/config"
 	"migration-tool-go/dtos"
+	"migration-tool-go/dtos/sources/postgres"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/samber/lo"
+	"regexp"
 )
 
 type Repo struct {
@@ -25,7 +27,7 @@ func NewRepo(db *pgxpool.Pool) *Repo {
 	}
 }
 
-func (r Repo) GetTableInfo(ctx context.Context, schemas []any) ([]dtos.TableInfo, error) {
+func (r Repo) GetTableInfo(ctx context.Context, schemas []any, config postgres.Configuration) ([]dtos.TableInfo, error) {
 	query := `
 		SELECT 
 			c.table_schema AS schema, 
@@ -52,7 +54,7 @@ func (r Repo) GetTableInfo(ctx context.Context, schemas []any) ([]dtos.TableInfo
 				AND table_schema = c.table_schema 
 				AND constraint_type = 'PRIMARY KEY'
 			)
-		WHERE c.table_schema in (%s) -- ✅ Ensures only the selected schema
+		WHERE c.table_schema in (%s) -- Ensures only the selected schema
 		ORDER BY c.table_name, c.ordinal_position;
         `
 
@@ -103,13 +105,53 @@ func (r Repo) GetTableInfo(ctx context.Context, schemas []any) ([]dtos.TableInfo
 		}
 	}
 
+	// Set query strategies based on configuration
+	for schemaName, tables := range tableMap {
+		for tableName, tableInfo := range tables {
+			// Check if there's a strategy in the include tables list
+			for _, tableList := range config.IncludeTablesList {
+				if tableList.Schema == schemaName {
+					for _, includedTable := range tableList.Tables {
+						if includedTable == tableName && tableList.QueryStrategy != nil {
+							tableInfo.QueryStrategy = tableList.QueryStrategy
+							break
+						}
+					}
+				}
+				if tableInfo.QueryStrategy != nil {
+					break
+				}
+			}
+
+			// If no strategy found, check the include table regex list
+			if tableInfo.QueryStrategy == nil {
+				for _, regexList := range config.IncludeTableRegexList {
+					if regexList.Schema == schemaName && regexList.QueryStrategy != nil {
+						// Check if the table name matches any of the regex patterns
+						for _, pattern := range regexList.Regex {
+							matched, err := regexp.MatchString(pattern, tableName)
+							if err == nil && matched {
+								tableInfo.QueryStrategy = regexList.QueryStrategy
+								break
+							}
+						}
+					}
+					if tableInfo.QueryStrategy != nil {
+						break
+					}
+				}
+			}
+		}
+	}
+
 	var tableInfoList []dtos.TableInfo
 
 	for _, v := range tableMap {
 		for _, v2 := range v {
-			if v2.TableName == "platform" {
+			if v2.TableName == "asset" {
 				tableInfoList = append(tableInfoList, *v2)
 			}
+			//tableInfoList = append(tableInfoList, *v2)
 		}
 	}
 
@@ -397,4 +439,235 @@ func deserializeRecords(rows pgx.Rows, columnMetaMap map[string]dtos.ColumnInfo,
 	}
 
 	return records
+}
+
+func (r Repo) GetMinValue(ctx context.Context, tableSchema string, tableName string, columnName string) (any, error) {
+	query := fmt.Sprintf("SELECT MIN(%s) FROM %s.%s", columnName, tableSchema, tableName)
+
+	var minValue any
+	err := r.db.QueryRow(ctx, query).Scan(&minValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get min value: %w", err)
+	}
+
+	return minValue, nil
+}
+
+func (r Repo) GetMaxValue(ctx context.Context, tableSchema string, tableName string, columnName string) (any, error) {
+	query := fmt.Sprintf("SELECT MAX(%s) FROM %s.%s", columnName, tableSchema, tableName)
+
+	var maxValue any
+	err := r.db.QueryRow(ctx, query).Scan(&maxValue)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get max value: %w", err)
+	}
+
+	return maxValue, nil
+}
+
+func (r Repo) GenerateRanges(ctx context.Context, min any, max any, frequency any, columnName string) ([]any, error) {
+	// Query to determine the data type of the column
+	query := fmt.Sprintf(`
+		SELECT data_type 
+		FROM information_schema.columns 
+		WHERE table_schema = $1 
+		AND table_name = $2 
+		AND column_name = $3
+	`)
+
+	var dataType string
+	err := r.db.QueryRow(ctx, query, "public", "table_name", columnName).Scan(&dataType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column data type: %w", err)
+	}
+
+	var ranges []any
+
+	// Handle different data types
+	switch dataType {
+	case "integer", "bigint", "smallint":
+		// For numeric types
+		minVal, ok := min.(int64)
+		if !ok {
+			return nil, fmt.Errorf("min value is not an integer")
+		}
+
+		maxVal, ok := max.(int64)
+		if !ok {
+			return nil, fmt.Errorf("max value is not an integer")
+		}
+
+		freqVal, ok := frequency.(int64)
+		if !ok {
+			return nil, fmt.Errorf("frequency is not an integer")
+		}
+
+		// Generate ranges
+		for val := minVal; val <= maxVal; val += freqVal {
+			ranges = append(ranges, val)
+		}
+
+		// Add the max value if it's not already included
+		if ranges[len(ranges)-1] != maxVal {
+			ranges = append(ranges, maxVal)
+		}
+
+	case "numeric", "decimal", "double precision", "real":
+		// For floating point types
+		minVal, ok := min.(float64)
+		if !ok {
+			return nil, fmt.Errorf("min value is not a float")
+		}
+
+		maxVal, ok := max.(float64)
+		if !ok {
+			return nil, fmt.Errorf("max value is not a float")
+		}
+
+		freqVal, ok := frequency.(float64)
+		if !ok {
+			return nil, fmt.Errorf("frequency is not a float")
+		}
+
+		// Generate ranges
+		for val := minVal; val <= maxVal; val += freqVal {
+			ranges = append(ranges, val)
+		}
+
+		// Add the max value if it's not already included
+		if ranges[len(ranges)-1] != maxVal {
+			ranges = append(ranges, maxVal)
+		}
+
+	case "timestamp", "timestamptz", "date":
+		// For timestamp types, use a different approach
+		// This would require parsing the timestamp strings and incrementing by the frequency
+		// For simplicity, we'll just return an error here
+		return nil, fmt.Errorf("timestamp ranges should use the time window strategy instead")
+
+	default:
+		return nil, fmt.Errorf("unsupported data type for range strategy: %s", dataType)
+	}
+
+	return ranges, nil
+}
+
+func (r Repo) GetMinTimeValue(ctx context.Context, tableSchema string, tableName string, columnName string) (string, error) {
+	query := fmt.Sprintf("SELECT MIN(%s)::text FROM %s.%s", columnName, tableSchema, tableName)
+
+	var minTime string
+	err := r.db.QueryRow(ctx, query).Scan(&minTime)
+	if err != nil {
+		return "", fmt.Errorf("failed to get min time value: %w", err)
+	}
+
+	return minTime, nil
+}
+
+func (r Repo) GetMaxTimeValue(ctx context.Context, tableSchema string, tableName string, columnName string) (string, error) {
+	query := fmt.Sprintf("SELECT MAX(%s)::text FROM %s.%s", columnName, tableSchema, tableName)
+
+	var maxTime string
+	err := r.db.QueryRow(ctx, query).Scan(&maxTime)
+	if err != nil {
+		return "", fmt.Errorf("failed to get max time value: %w", err)
+	}
+
+	return maxTime, nil
+}
+
+func (r Repo) GenerateTimeWindows(ctx context.Context, startTime string, endTime string, windowSize string) ([]any, error) {
+	// Query to generate time windows using PostgreSQL's generate_series function
+	query := fmt.Sprintf(`
+		SELECT generate_series::text 
+		FROM generate_series(
+			$1::timestamp, 
+			$2::timestamp, 
+			$3::interval
+		)
+	`)
+
+	rows, err := r.db.Query(ctx, query, startTime, endTime, windowSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate time windows: %w", err)
+	}
+	defer rows.Close()
+
+	var timeWindows []any
+	for rows.Next() {
+		var timeWindow string
+		if err := rows.Scan(&timeWindow); err != nil {
+			return nil, fmt.Errorf("failed to scan time window: %w", err)
+		}
+		timeWindows = append(timeWindows, timeWindow)
+	}
+
+	// Add the end time if it's not already included
+	if len(timeWindows) > 0 && timeWindows[len(timeWindows)-1] != endTime {
+		timeWindows = append(timeWindows, endTime)
+	}
+
+	return timeWindows, nil
+}
+
+func (r Repo) GetRecordsByColumnRange(ctx context.Context, columnMeta []dtos.ColumnInfo, tableSchema string, tableName string, rangeType string, startValue any, endValue any, columnName string) ([]map[string]any, error) {
+	// Build the column list
+	var columnNames []string
+	for _, col := range columnMeta {
+		columnNames = append(columnNames, col.Name)
+	}
+
+	// Build the column meta map for deserialization
+	columnMetaMap := lo.SliceToMap(columnMeta, func(item dtos.ColumnInfo) (string, dtos.ColumnInfo) {
+		return item.Name, item
+	})
+
+	var operator string
+
+	switch rangeType {
+	case "column_range":
+		// For regular column ranges, use >= and <
+		operator = fmt.Sprintf("%s BETWEEN $1 AND $2", columnName)
+	case "time_window":
+		// For time windows, use >= and <
+		operator = fmt.Sprintf("%s >= $1 AND %s < $2", columnName, columnName)
+	case "fixed_value":
+		// For fixed values, use =
+		operator = "= $1"
+	default:
+		return nil, fmt.Errorf("unsupported range type: %s", rangeType)
+	}
+
+	// Build the query
+	var query string
+	var args []any
+
+	if rangeType == "fixed_value" {
+		query = fmt.Sprintf(
+			"SELECT %s FROM %s.%s WHERE %s %s",
+			strings.Join(columnNames, ", "),
+			tableSchema,
+			tableName,
+			columnName,
+			operator,
+		)
+		args = []any{startValue}
+	} else {
+		query = fmt.Sprintf(
+			"SELECT %s FROM %s.%s WHERE %s",
+			strings.Join(columnNames, ", "),
+			tableSchema,
+			tableName,
+			operator,
+		)
+		args = []any{startValue, endValue}
+	}
+
+	// Execute the query
+	rows, err := r.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch records by column range: %w", err)
+	}
+
+	return deserializeRecords(rows, columnMetaMap, columnNames), nil
 }
