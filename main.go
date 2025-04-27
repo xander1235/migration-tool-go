@@ -42,6 +42,22 @@ func main() {
 		sig := <-sigChan
 		logger.Sugar.Infof("Received signal %v, initiating graceful shutdown", sig)
 		cancel()
+		
+		// Add a timeout for graceful shutdown
+		gracefulTimeout := 10 * time.Second
+		logger.Sugar.Infof("Waiting up to %s for graceful shutdown...", gracefulTimeout)
+		
+		// Create a timeout channel
+		timeoutChan := time.After(gracefulTimeout)
+		
+		// Wait for either the context to be done or the timeout
+		select {
+		case <-ctx.Done():
+			logger.Sugar.Info("Graceful shutdown completed")
+		case <-timeoutChan:
+			logger.Sugar.Warn("Graceful shutdown timed out, forcing exit")
+			os.Exit(1)
+		}
 	}()
 
 	// Initialize configuration
@@ -62,8 +78,17 @@ func main() {
 	logger.Sugar.Info("Initializing PostgreSQL migration service")
 	services.NewPostgresMigration(config.SourceConfig, config.WorkerConfig)
 
-	logger.Sugar.Info("Initializing Doris sync service")
-	services.NewDorisSync(config.DestinationConfig)
+	// Initialize the appropriate destination connectors based on the destination type
+	switch config.DestinationConfig.Type {
+	case "doris":
+		logger.Sugar.Info("Initializing Doris connector")
+		services.NewDorisConnector(config.DestinationConfig)
+	case "kafka":
+		logger.Sugar.Info("Initializing Kafka connector")
+		services.NewKafkaConnector(config.DestinationConfig)
+	default:
+		logger.Sugar.Fatalf("Unsupported destination type: %s", config.DestinationConfig.Type)
+	}
 
 	logger.Sugar.Info("Initializing migration runner")
 	services.NewMigrationRunner(config.WorkerConfig)

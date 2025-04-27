@@ -9,11 +9,15 @@ import (
 	"migration-tool-go/dtos/sources/postgres"
 	"migration-tool-go/logger"
 	"migration-tool-go/repository"
+	"migration-tool-go/utils"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 var PostgresMigration = &postgresMigration{}
@@ -22,17 +26,13 @@ type postgresMigration struct {
 	configuration postgres.Configuration
 	workerConfig  common.WorkerConfiguration
 	repo          *repository.Repo
+	// Add semaphore for controlling concurrent operations
+	workerSemaphore *semaphore.Weighted
+	// Add channel capacity tracking
+	channelCapacity   int
+	channelUtilization int64
+	lastUtilizationLog time.Time
 }
-
-//type TableInfoChan struct {
-//	TableInfo          dtos.TableInfo
-//	PrimaryKeyRange    chan dtos.PrimaryKeyRange
-//	RecordsChan        chan map[string]any
-//	TotalUuidsRead     *int
-//	TotalRecordsRead   *int
-//	ReadingIdsDone     *bool
-//	ReadingRecordsDone *bool
-//}
 
 func NewPostgresMigration(source common.Source[any], workerConfig common.WorkerConfiguration) {
 	PostgresMigration = &postgresMigration{
@@ -40,6 +40,23 @@ func NewPostgresMigration(source common.Source[any], workerConfig common.WorkerC
 		workerConfig:  workerConfig,
 		repo:          repository.NewRepo(config.NewConnection(source.Value.(postgres.Postgres), workerConfig.NoOfWorkers)),
 	}
+	
+	// Initialize the migration service
+	PostgresMigration.Init()
+	logger.Sugar.Info("PostgreSQL migration service initialized")
+}
+
+func (p *postgresMigration) Init() {
+	// Initialize semaphore with worker count
+	p.workerSemaphore = semaphore.NewWeighted(int64(p.workerConfig.NoOfWorkers))
+	p.channelCapacity = 1000 // Default channel capacity
+	if p.workerConfig.RecordBatchSize > 0 {
+		p.channelCapacity = p.workerConfig.RecordBatchSize * 2 // Use record batch size as a basis for channel capacity
+	}
+	p.lastUtilizationLog = time.Now()
+	
+	logger.Sugar.Infof("Initialized PostgreSQL migration with %d workers and channel capacity of %d", 
+		p.workerConfig.NoOfWorkers, p.channelCapacity)
 }
 
 func (p postgresMigration) GetRecordsFromSource(ctx context.Context, tableInfoChan chan *dtos.TableInfoChan, processedAllTables *bool) error {
@@ -202,18 +219,9 @@ func (p postgresMigration) processRangeStrategy(ctx context.Context, tableInfoCh
 }
 
 // processFixedValuesStrategy processes a table using fixed values
-func (p postgresMigration) processFixedValuesStrategy(ctx context.Context, tableInfoChan *dtos.TableInfoChan, strategy *postgres.QueryStrategy) {
-	if strategy.FixedValuesParams == nil || len(strategy.FixedValuesParams.Values) == 0 {
-		logger.Sugar.Errorf("Fixed values strategy parameters are missing or empty")
-		tableInfoChan.ReadingIdsDone.Store(true)
-		return
-	}
-
-	batchSize := strategy.FixedValuesParams.BatchSize
-	if batchSize <= 0 {
-		batchSize = p.workerConfig.WorkerBatchSize
-	}
-
+func (p *postgresMigration) processFixedValuesStrategy(ctx context.Context, tableInfoChan *dtos.TableInfoChan, strategy *postgres.QueryStrategy) {
+	logger.Sugar.Infof("Processing table %s using fixed values strategy on column %s", tableInfoChan.TableInfo.TableName, strategy.Column)
+	
 	// Send each fixed value as a separate range
 	for _, value := range strategy.FixedValuesParams.Values {
 		tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{
@@ -221,9 +229,11 @@ func (p postgresMigration) processFixedValuesStrategy(ctx context.Context, table
 			IdRange: [2]any{value, value},
 		}
 	}
-
-	tableInfoChan.IncrementTotalUuidsRead(uint64(len(strategy.FixedValuesParams.Values)))
+	
+	// Close the channel to signal no more ranges
+	close(tableInfoChan.PrimaryKeyRange)
 	tableInfoChan.ReadingIdsDone.Store(true)
+	tableInfoChan.IncrementTotalUuidsRead(uint64(len(strategy.FixedValuesParams.Values)))
 }
 
 // processTimeWindowStrategy processes a table using time windows
@@ -313,51 +323,171 @@ func (p postgresMigration) processBatchSizeStrategy(ctx context.Context, tableIn
 }
 
 func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, infoChan *dtos.TableInfoChan) {
-
 	wg := sync.WaitGroup{}
-	parallelProcessingChan := make(chan bool, p.workerConfig.NoOfWorkers)
 	processingDone := false
+
+	// Set up memory threshold monitoring
+	memThreshold := utils.DefaultMemoryThreshold()
+
+	// Customize thresholds based on config if needed
+	if p.workerConfig.MemoryWarningThresholdPercent > 0 {
+		memThreshold.WarningPercent = p.workerConfig.MemoryWarningThresholdPercent
+	}
+	if p.workerConfig.MemoryCriticalThresholdPercent > 0 {
+		memThreshold.CriticalPercent = p.workerConfig.MemoryCriticalThresholdPercent
+	}
+	if p.workerConfig.MemoryCooldownSeconds > 0 {
+		memThreshold.CooldownSeconds = p.workerConfig.MemoryCooldownSeconds
+	}
+
+	// Track consecutive memory threshold hits
+	consecutiveThresholdHits := 0
+	maxConsecutiveHits := 5 // After this many consecutive hits, increase cooldown
+
+	// Track channel backpressure
+	backpressureStartTime := time.Time{}
+	
+	// Start a goroutine to periodically log channel utilization
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ticker.C:
+				// Log channel utilization
+				capacity := cap(infoChan.RecordsChan)
+				used := len(infoChan.RecordsChan)
+				utilization := float64(used) / float64(capacity) * 100
+				
+				logger.Sugar.Infof("Channel utilization: %.2f%% (%d/%d)", 
+					utilization, used, capacity)
+					
+				// If channel is getting full, log a warning
+				if utilization > 80 {
+					logger.Sugar.Warnf("High channel utilization (%.2f%%), possible backpressure", 
+						utilization)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case primaryKeyRange := <-infoChan.PrimaryKeyRange:
-			parallelProcessingChan <- true
+			// Check memory usage before processing
+			if utils.CheckMemoryThreshold(memThreshold) {
+				// Memory usage is high, we've already paused in the CheckMemoryThreshold function
+				// Increment consecutive hits counter
+				consecutiveThresholdHits++
+
+				// If we've hit the threshold multiple times in a row, increase cooldown time
+				if consecutiveThresholdHits >= maxConsecutiveHits {
+					logger.Sugar.Warnf("Memory pressure persists after %d consecutive checks in getRecordsFromPrimaryKeyRange, increasing cooldown time",
+						consecutiveThresholdHits)
+
+					// Double the cooldown time temporarily
+					extraCooldown := memThreshold.CooldownSeconds * 2
+					time.Sleep(time.Duration(extraCooldown) * time.Second)
+
+					// Force GC again
+					runtime.GC()
+
+					// Reset counter
+					consecutiveThresholdHits = 0
+				}
+			} else {
+				// Memory usage is acceptable, reset counter
+				consecutiveThresholdHits = 0
+			}
+
+			// Check for channel backpressure
+			channelCap := cap(infoChan.RecordsChan)
+			channelLen := len(infoChan.RecordsChan)
+			channelUtilization := float64(channelLen) / float64(channelCap) * 100
+			
+			// If channel is more than 80% full, implement backpressure handling
+			if channelUtilization > 80 {
+				if backpressureStartTime.IsZero() {
+					// First time we're seeing backpressure
+					backpressureStartTime = time.Now()
+					logger.Sugar.Warnf("Channel backpressure detected: %.2f%% full (%d/%d)", 
+						channelUtilization, channelLen, channelCap)
+				} else if time.Since(backpressureStartTime) > 30*time.Second {
+					// Sustained backpressure for more than 30 seconds
+					logger.Sugar.Warnf("Sustained channel backpressure for %v: %.2f%% full (%d/%d)", 
+						time.Since(backpressureStartTime).Round(time.Second), 
+						channelUtilization, channelLen, channelCap)
+					
+					// Sleep to allow downstream processing to catch up
+					sleepTime := 500 * time.Millisecond
+					logger.Sugar.Infof("Pausing for %v to allow downstream processing to catch up", sleepTime)
+					time.Sleep(sleepTime)
+				}
+			} else {
+				// Reset backpressure timer if channel is no longer under pressure
+				backpressureStartTime = time.Time{}
+			}
+
+			// Acquire semaphore before starting a new worker goroutine
+			// This blocks if we already have the maximum number of workers
+			err := p.workerSemaphore.Acquire(ctx, 1)
+			if err != nil {
+				// Context was likely canceled
+				logger.Sugar.Errorf("Failed to acquire semaphore: %v", err)
+				continue
+			}
+
 			wg.Add(1)
-			go func(wgIn *sync.WaitGroup, parallelProcessingChanIn chan bool) {
-				switch primaryKeyRange.Type {
+			go func(wgIn *sync.WaitGroup, pkRange dtos.PrimaryKeyRange) {
+				// Ensure we release the semaphore when done
+				defer p.workerSemaphore.Release(1)
+				defer wgIn.Done()
+
+				// Process based on query strategy
+				switch pkRange.Type {
 				case "id_range":
-					records, err := p.repo.GetRecordsById(ctx, infoChan.TableInfo.Columns, infoChan.TableInfo.PrimaryKeys[0].ColumnName, infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName, primaryKeyRange.IdRange[0], primaryKeyRange.IdRange[1])
+					records, err := p.repo.GetRecordsById(ctx, infoChan.TableInfo.Columns, infoChan.TableInfo.PrimaryKeys[0].ColumnName, infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName, pkRange.IdRange[0], pkRange.IdRange[1])
 
 					if err != nil {
 						logger.Sugar.Errorf("Failed to fetch records by uuids: %v", err)
 					} else {
-						//uuidStr := uuid.New().String()
-						//utils.ConvertRecordsToJSON(records, fmt.Sprintf("records_json/%s_debug.json", uuidStr), true)
-						//
-						//utils.ConvertRecordsToJSON([]any{primaryKeyRange.IdRange}, fmt.Sprintf("uuid_range_json/%s_debug.json", uuidStr), true)
-
-						for _, record := range records {
-							infoChan.RecordsChan <- record
-						}
-
+						// First increment the read counter before sending to channel
 						infoChan.IncrementTotalRecordsRead(uint64(len(records)))
-						infoChan.IncrementTotalUuidsProcessed(1)
-					}
 
+						// Send records to the channel with retry logic
+						p.sendRecordsWithRetry(ctx, records, infoChan)
+
+						infoChan.IncrementTotalUuidsProcessed(1)
+
+						// Help GC by clearing the records slice
+						for i := range records {
+							records[i] = nil
+						}
+						records = nil
+					}
 				case "multi_key":
-					records, err := p.repo.GetRecordsByMultiPrimaryKeys(ctx, infoChan.TableInfo.Columns, infoChan.TableInfo.PrimaryKeys, infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName, primaryKeyRange.MultiKeyRange[0], primaryKeyRange.MultiKeyRange[1])
+					records, err := p.repo.GetRecordsByMultiPrimaryKeys(ctx, infoChan.TableInfo.Columns, infoChan.TableInfo.PrimaryKeys, infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName, pkRange.MultiKeyRange[0], pkRange.MultiKeyRange[1])
 
 					if err != nil {
 						logger.Sugar.Errorf("Failed to fetch records by multi primary keys: %v", err)
-
 					} else {
-						for _, record := range records {
-							infoChan.RecordsChan <- record
-						}
-
+						// First increment the read counter before sending to channel
 						infoChan.IncrementTotalRecordsRead(uint64(len(records)))
-						infoChan.IncrementTotalUuidsProcessed(1)
-					}
 
+						// Send records to the channel with retry logic
+						p.sendRecordsWithRetry(ctx, records, infoChan)
+
+						infoChan.IncrementTotalUuidsProcessed(1)
+
+						// Help GC by clearing the records slice
+						for i := range records {
+							records[i] = nil
+						}
+						records = nil
+					}
 				case "column_range", "time_window", "fixed_value":
 					var columnName = infoChan.TableInfo.PrimaryKeys[0].ColumnName
 
@@ -365,38 +495,31 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 						columnName = infoChan.TableInfo.QueryStrategy.Column
 					}
 
-					records, err := p.repo.GetRecordsByColumnRange(ctx, infoChan.TableInfo.Columns, infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName, primaryKeyRange.Type, primaryKeyRange.IdRange[0], primaryKeyRange.IdRange[1], columnName)
+					records, err := p.repo.GetRecordsByColumnRange(ctx, infoChan.TableInfo.Columns, infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName, pkRange.Type, pkRange.IdRange[0], pkRange.IdRange[1], columnName)
 
 					if err != nil {
 						logger.Sugar.Errorf("Failed to fetch records by column range: %v", err)
 					} else {
-						for _, record := range records {
-							infoChan.RecordsChan <- record
-						}
-
+						// First increment the read counter before sending to channel
 						infoChan.IncrementTotalRecordsRead(uint64(len(records)))
+
+						// Send records to the channel with retry logic
+						p.sendRecordsWithRetry(ctx, records, infoChan)
+
 						infoChan.IncrementTotalUuidsProcessed(1)
+
+						// Help GC by clearing the records slice
+						for i := range records {
+							records[i] = nil
+						}
+						records = nil
 					}
 				}
 
-				<-parallelProcessingChanIn
-				wgIn.Done()
-			}(&wg, parallelProcessingChan)
-
-			// Add the timeout to read the chan to prevent it from blocking
-		case <-time.After(5 * time.Second):
-			if infoChan.ReadingIdsDone.Load().(bool) {
-				if len(infoChan.PrimaryKeyRange) == 0 {
-					logger.Sugar.Infof("Finished reading the ids %s.%s", infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName)
-				}
-
-				if infoChan.GetTotalUuidsRead() == infoChan.GetTotalUuidsProcessed() {
-					infoChan.ReadingRecordsDone.Store(true)
-					logger.Sugar.Infof("Finished reading the records %s.%s", infoChan.TableInfo.TableSchema, infoChan.TableInfo.TableName)
-					processingDone = true
-					break
-				}
-			}
+			}(&wg, primaryKeyRange)
+		case <-ctx.Done():
+			processingDone = true
+			break
 		}
 
 		if processingDone {
@@ -404,14 +527,69 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 		}
 	}
 
-	defer close(parallelProcessingChan)
+	logger.Sugar.Info("Waiting for all workers to complete...")
 	wg.Wait()
+	logger.Sugar.Info("All workers completed")
+}
+
+// sendRecordsWithRetry sends records to the channel with exponential backoff retry
+func (p *postgresMigration) sendRecordsWithRetry(ctx context.Context, records []map[string]any, infoChan *dtos.TableInfoChan) {
+	for _, record := range records {
+		// Start with a small backoff that will increase exponentially
+		backoff := 10 * time.Millisecond
+		maxBackoff := 5 * time.Second
+		retryCount := 0
+		
+		for {
+			// Try to send the record to the channel
+			select {
+			case infoChan.RecordsChan <- record:
+				// Successfully sent, move to next record
+				goto nextRecord
+			case <-ctx.Done():
+				// Context cancelled, exit
+				logger.Sugar.Warnf("Context cancelled while sending record to channel after %d retries", retryCount)
+				return
+			default:
+				// Channel is full, wait and retry with backoff
+				if retryCount == 0 || retryCount%10 == 0 {
+					// Log on first retry and every 10 retries after that
+					logger.Sugar.Warnf("Channel full, implementing backoff (attempt #%d, channel capacity: %d/%d)", 
+						retryCount+1, len(infoChan.RecordsChan), cap(infoChan.RecordsChan))
+				}
+				
+				// Wait with backoff before retrying
+				select {
+				case <-time.After(backoff):
+					// Increase backoff for next retry
+					backoff = time.Duration(float64(backoff) * 1.5)
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+					retryCount++
+					
+					// If we've been retrying for a long time, log a warning but NEVER drop the record
+					if retryCount > 0 && retryCount%50 == 0 {
+						logger.Sugar.Warnf("Still trying to send record after %d attempts. Will continue until successful.", retryCount)
+					}
+				case <-ctx.Done():
+					// Context cancelled during backoff
+					return
+				}
+			}
+		}
+		
+	nextRecord:
+		// Record successfully sent or context cancelled
+		continue
+	}
+	
+	// Log successful completion
+	logger.Sugar.Infof("Successfully sent all %d records", len(records))
 }
 
 func (p postgresMigration) getPrimaryKeyRange(ctx context.Context, lastId any, includeLastId bool, primaryKey string, idBatchSize int, workerBatchSize int, tableInfoChan *dtos.TableInfoChan) {
-
 	for {
-
 		ids, err := p.repo.FetchBatchPrimaryKeys(ctx, lastId, includeLastId, tableInfoChan.TableInfo.TableSchema, tableInfoChan.TableInfo.TableName, primaryKey, idBatchSize)
 
 		if err != nil {
@@ -428,8 +606,6 @@ func (p postgresMigration) getPrimaryKeyRange(ctx context.Context, lastId any, i
 			break
 		}
 
-		//utils.ConvertRecordsToJSON(ids, fmt.Sprintf("uuids_json/%s_debug.json", uuid.New().String()), true)
-
 		// Divide into batches of 10K (first & last UUID)
 		for i := 0; i < len(ids); i += workerBatchSize {
 			end := i + workerBatchSize
@@ -437,20 +613,27 @@ func (p postgresMigration) getPrimaryKeyRange(ctx context.Context, lastId any, i
 				end = len(ids)
 			}
 
-			tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{Type: "id_range", IdRange: [2]any{ids[i], ids[end-1]}}
+			// Check if channel is getting full, which indicates downstream processing is slow
+			channelCap := cap(tableInfoChan.PrimaryKeyRange)
+			if len(tableInfoChan.PrimaryKeyRange) > channelCap*3/4 {
+				logger.Sugar.Warnf("PrimaryKeyRange channel is getting full (%d/%d), pausing ID fetching",
+					len(tableInfoChan.PrimaryKeyRange), channelCap)
+				time.Sleep(5 * time.Second)
+			}
 
-			//switch tableInfo.PrimaryKeys[0].DataType {
-			//case "uuid":
-			//	tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{Type: "id_range", IdRange: [2]any{ids[i], ids[end-1]}}
-			//case "int", "int4", "int8":
-			//	tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{Type: "id_range", IdRange: [2]any{ids[i], ids[end-1]}}
-			//}
+			tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{Type: "id_range", IdRange: [2]any{ids[i], ids[end-1]}}
 		}
 
 		tableInfoChan.IncrementTotalUuidsRead(uint64(len(ids)))
 
 		// Update lastUUID for next iteration
 		lastId = ids[len(ids)-1]
+
+		// Help GC by clearing the ids slice
+		for i := range ids {
+			ids[i] = nil
+		}
+		ids = nil
 	}
 }
 

@@ -2,24 +2,24 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"migration-tool-go/config"
 	"migration-tool-go/dtos"
 	"migration-tool-go/dtos/common"
 	"migration-tool-go/logger"
-	"migration-tool-go/utils"
+	"os"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
-	"github.com/samber/lo"
 )
 
 var MigrationRunner = &migrationRunner{}
 
 type migrationRunner struct {
 	startTime     time.Time
-	failedRecords map[string][]map[string]any
+	failedRecords sync.Map // Use sync.Map for thread-safe concurrent access
 	workerConfig  *common.WorkerConfiguration
+	mapMutex      sync.Mutex
 }
 
 // Initialize sets up the migration runner
@@ -66,7 +66,7 @@ func (m *migrationRunner) Run(ctx context.Context) error {
 	tableInfoChan := make(chan *dtos.TableInfoChan, m.workerConfig.ConcurrentTables)
 	processedAllTables := false
 	// Map to track failed records by table name
-	m.failedRecords = make(map[string][]map[string]any)
+	m.failedRecords = sync.Map{}
 
 	// Start the source data extraction in a goroutine
 	go func() {
@@ -86,202 +86,170 @@ func (m *migrationRunner) Run(ctx context.Context) error {
 			}
 
 			// Process the received table information
-			records := m.processTableInfo(infoChan)
+			records := m.processTableInfo(ctx, infoChan)
 
 			// Check if we should exit the loop
 			if len(records) == 0 && processedAllTables {
 				exitTableProcessing = true
+				break
 			}
 		case <-ctx.Done():
 			// Context cancelled or timed out
 			logger.Sugar.Info("Migration stopped due to context cancellation")
 			exitTableProcessing = true
+			break
 		}
 	}
 
 	logger.Sugar.Infof("Migration completed. Total time taken: %s", time.Since(m.startTime))
 
 	// Handle any failed records if needed
-	if len(m.failedRecords) > 0 {
-		logger.Sugar.Infof("There were failed records: %d tables had failures", len(m.failedRecords))
+	failedTablesCount := 0
+	m.failedRecords.Range(func(key, value interface{}) bool {
+		records := value.([]map[string]any)
+		if len(records) > 0 {
+			failedTablesCount++
+		}
+		return true
+	})
+
+	if failedTablesCount > 0 {
+		logger.Sugar.Infof("There were failed records: %d tables had failures", failedTablesCount)
 
 		// Save failed records to files for later analysis or retry
-		for tableName, records := range m.failedRecords {
-			if len(records) == 0 {
-				continue
-			}
-			filePath := fmt.Sprintf("%s_failed_records.json", tableName)
-			logger.Sugar.Infof("Saving %d failed records for table %s to %s", len(records), tableName, filePath)
-
-			_, err := utils.ConvertRecordsToJSON(records, filePath, true)
-			if err != nil {
-				logger.Sugar.Errorf("Failed to save failed records for table %s: %v", tableName, err)
-			}
-		}
+		m.handleFailedRecords()
 	}
 
 	return nil
 }
 
 // processTableInfo handles the processing of a single table's data
-func (m *migrationRunner) processTableInfo(infoChan *dtos.TableInfoChan) []map[string]any {
-	var records []map[string]any
-	checkAllRecordsProcessed := make(map[string]uint64)
-	processedRecordsChan := false
+func (m *migrationRunner) processTableInfo(ctx context.Context, infoChan *dtos.TableInfoChan) []map[string]any {
+	checkAllRecordsProcessed := &sync.Map{}
 
 	// Initialize failed records tracking for this table if needed
-	if _, exists := m.failedRecords[infoChan.TableInfo.TableName]; !exists {
-		m.failedRecords[infoChan.TableInfo.TableName] = []map[string]any{}
+	_, loaded := m.failedRecords.LoadOrStore(infoChan.TableInfo.TableName, []map[string]any{})
+	if !loaded {
+		logger.Sugar.Infof("Initialized failed records tracking for table %s", infoChan.TableInfo.TableName)
 	}
 
-	wg := sync.WaitGroup{}
-	noOfWorkers := uint32(m.workerConfig.NoOfWorkers / 2)
-	parallelProcessingChan := make(chan bool, noOfWorkers)
+	// Create a context that can be cancelled
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
+	// Initialize connectors based on destination type
+	var activeConnectors []Connector
+	
+	switch config.DestinationConfig.Type {
+	case "doris":
+		// Initialize Doris connector
+		activeConnectors = append(activeConnectors, DorisConnector)
+		DorisConnector.Initialize(ctx, infoChan, checkAllRecordsProcessed)
+		
+	case "kafka":
+		// Initialize Kafka connector
+		activeConnectors = append(activeConnectors, KafkaConnector)
+		KafkaConnector.Initialize(ctx, infoChan, checkAllRecordsProcessed)
+		
+	default:
+		logger.Sugar.Warnf("Unsupported destination type: %s", config.DestinationConfig.Type)
+		return nil
+	}
+	
+	if len(activeConnectors) == 0 {
+		logger.Sugar.Warn("No active connectors initialized")
+		return nil
+	}
+
+	// Start a goroutine to log progress
 	go func() {
-
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
 		for {
 			select {
-			case <-time.After(time.Duration(10000) * time.Millisecond):
-				logger.Sugar.Infof("Migration for table %s in progress, total uuids read: %d, total records read: %d, total records processed: %d, time taken: %s",
+			case <-ticker.C:
+				logger.Sugar.Infof("Progress for table %s: %d UUIDs read, %d records read, %d records processed, elapsed time: %s",
 					infoChan.TableInfo.TableName,
 					infoChan.GetTotalUuidsRead(),
 					infoChan.GetTotalRecordsRead(),
 					infoChan.GetTotalRecordsProcessed(),
 					time.Since(m.startTime).String(),
 				)
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
-	var workerId uint32 = 0
+	// Start processing records for each connector
+	for _, connector := range activeConnectors {
+		go connector.ProcessRecords(ctx, infoChan.RecordsChan)
+	}
 
-	// Process records from the channel
-	for !processedRecordsChan {
-		select {
-		case record, ok := <-infoChan.RecordsChan:
-			if !ok {
-				processedRecordsChan = true
-				break
-			}
-
-			// Append the record to our batch
-			records = append(records, record)
-
-			// Process in batches based on configured record batch size
-			if len(records) >= m.workerConfig.RecordBatchSize {
-				workerId = uint32((workerId + 1) % noOfWorkers)
-
-				// Process exactly the record batch size number of records
-				batchRecords := records[:m.workerConfig.RecordBatchSize]
-				wg.Add(1)
-				parallelProcessingChan <- true
-				go m.processBatch(infoChan, batchRecords, checkAllRecordsProcessed, uuid.New().String(), &wg, parallelProcessingChan, workerId)
-
-				// Keep any remaining records for the next batch
-				if len(records) > m.workerConfig.RecordBatchSize {
-					records = records[m.workerConfig.RecordBatchSize:]
-				} else {
-					records = nil // Clear the batch if we processed all records
-				}
-
-				// Check if we're done processing all records for this table
-				if m.checkTableProcessed(infoChan, checkAllRecordsProcessed) {
-					processedRecordsChan = true
-					logger.Sugar.Infof("Processed records are done")
+	// Wait for all records to be processed or context cancellation
+	done := make(chan struct{})
+	go func() {
+		for {
+			// Check if we're done processing all records for this table
+			allDone := true
+			for _, connector := range activeConnectors {
+				if !connector.IsProcessingDone() {
+					allDone = false
 					break
 				}
 			}
-
-		case <-time.After(time.Duration(m.workerConfig.BatchProcessingTimeoutMs) * time.Millisecond): // Use configured batch processing timeout
-			// Process any accumulated records if we have some and haven't received any new ones for the configured timeout
-			if len(records) > 0 {
-				// If we have records exceeding the record batch size, process them in appropriate batches
-				if len(records) >= m.workerConfig.RecordBatchSize {
-					// Process exactly the record batch size number of records
-					batchRecords := records[:m.workerConfig.RecordBatchSize]
-					wg.Add(1)
-					parallelProcessingChan <- true
-					go m.processBatch(infoChan, batchRecords, checkAllRecordsProcessed, uuid.New().String(), &wg, parallelProcessingChan, workerId)
-
-					// Keep any remaining records for the next batch
-					records = records[m.workerConfig.RecordBatchSize:]
-				} else {
-					// Process all remaining records if less than batch size
-					wg.Add(1)
-					parallelProcessingChan <- true
-					go m.processBatch(infoChan, records, checkAllRecordsProcessed, uuid.New().String(), &wg, parallelProcessingChan, workerId)
-					records = nil
-				}
+			
+			if allDone {
+				close(done)
+				return
 			}
+			
+			// Sleep a bit to avoid busy waiting
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	
+	// Wait for either completion or context cancellation
+	select {
+	case <-done:
+		logger.Sugar.Infof("Finished processing all records for table %s", infoChan.TableInfo.TableName)
+	case <-ctx.Done():
+		logger.Sugar.Warnf("Processing of table %s was cancelled", infoChan.TableInfo.TableName)
+	}
 
-			// Check if we're done processing all records for this table
-			if m.checkTableProcessed(infoChan, checkAllRecordsProcessed) {
-				processedRecordsChan = true
-				logger.Sugar.Infof("Processed records are done")
-				break
-			}
-
+	// Close all connectors
+	for _, connector := range activeConnectors {
+		if err := connector.Close(); err != nil {
+			logger.Sugar.Errorf("Error closing connector: %v", err)
 		}
 	}
 
-	wg.Wait()
-	close(parallelProcessingChan)
-
-	return records
-}
-
-// processBatch handles processing a batch of records
-func (m *migrationRunner) processBatch(infoChan *dtos.TableInfoChan, records []map[string]any, checkAllRecordsProcessed map[string]uint64, uuidStr string, wg *sync.WaitGroup, parallelProcessingChan chan bool, workerId uint32) {
-
-	//logger.Sugar.Infof("Process batch for table %s in progress, batch size: %d/%d records, batch timeout: %dms",
-	//	infoChan.TableInfo.TableName,
-	//	len(records),
-	//	m.workerConfig.RecordBatchSize,
-	//	m.workerConfig.BatchProcessingTimeoutMs,
-	//)
-
-	// Convert records to JSON for Doris
-	bytesData, err := utils.ConvertRecordsToJSON(records, fmt.Sprintf("final/%s_debug.json", uuidStr), false)
-	if err != nil {
-		logger.Sugar.Errorf("Failed to marshal records for table %s: %v", infoChan.TableInfo.TableName, err)
-		// Add the records to the failed records collection
-		m.failedRecords[infoChan.TableInfo.TableName] = append(m.failedRecords[infoChan.TableInfo.TableName], records...)
-		wg.Done()
-		<-parallelProcessingChan
-		return
+	// Retrieve failed records
+	var failedRecords []map[string]any
+	// In a real implementation, we would get failed records from each connector
+	// For now, we'll just use the existing failed records mechanism
+	for _, connector := range activeConnectors {
+		failedRecords = append(failedRecords, connector.GetFailedRecords()...)
 	}
 
-	// Send the data to Doris
-	err = DorisSyncService.SyncDoris(bytesData, uint64(len(records)), infoChan.TableInfo.TableName, uuidStr, checkAllRecordsProcessed, workerId)
-	if err != nil {
-		logger.Sugar.Errorf("Failed to sync data to Doris for table %s: %v", infoChan.TableInfo.TableName, err)
-		// Add the records to the failed records collection
-		m.failedRecords[infoChan.TableInfo.TableName] = append(m.failedRecords[infoChan.TableInfo.TableName], records...)
-		wg.Done()
-		<-parallelProcessingChan
-		return
-	}
-
-	infoChan.IncrementTotalRecordsProcessed(uint64(len(records)))
-
-	wg.Done()
-	<-parallelProcessingChan
+	return failedRecords
 }
 
-// checkTableProcessed determines if processing for a table is complete
-func (m *migrationRunner) checkTableProcessed(
-	infoChan *dtos.TableInfoChan,
-	checkAllRecordsProcessed map[string]uint64,
-) bool {
-	// Check if we've read all records and processed all records
-	totalProcessed := lo.Sum(lo.Values(checkAllRecordsProcessed))
-
-	// Consider failed records when determining if we're done
-	totalFailedRecords := len(m.failedRecords[infoChan.TableInfo.TableName])
+// checkTableProcessed checks if all records for a table have been processed
+func (m *migrationRunner) checkTableProcessed(infoChan *dtos.TableInfoChan, checkAllRecordsProcessed *sync.Map) bool {
+	// Get total failed records
+	totalFailedRecords := 0
+	failedRecordsInterface, ok := m.failedRecords.Load(infoChan.TableInfo.TableName)
+	if ok {
+		failedRecords, ok := failedRecordsInterface.([]map[string]any)
+		if ok {
+			totalFailedRecords = len(failedRecords)
+		}
+	}
 
 	// If we've read all records and processed all of them (including failures), we're done with this table
-	if infoChan.ReadingRecordsDone.Load().(bool) && (infoChan.GetTotalRecordsProcessed()+uint64(totalFailedRecords)) == infoChan.GetTotalRecordsRead() {
+	if infoChan.ReadingRecordsDone.Load().(bool) && (infoChan.GetTotalRecordsProcessed()+uint64(totalFailedRecords)) >= infoChan.GetTotalRecordsRead() {
 		logger.Sugar.Infof("Migration for table %s completed, workers: %d, batch size: %d, batch timeout: %dms, total uuids read: %d, total records read: %d, total records processed: %d, failed records: %d, time taken: %s",
 			infoChan.TableInfo.TableName,
 			m.workerConfig.NoOfWorkers,
@@ -289,12 +257,37 @@ func (m *migrationRunner) checkTableProcessed(
 			m.workerConfig.BatchProcessingTimeoutMs,
 			infoChan.GetTotalUuidsRead(),
 			infoChan.GetTotalRecordsRead(),
-			totalProcessed,
+			infoChan.GetTotalRecordsProcessed(),
 			totalFailedRecords,
 			time.Since(m.startTime).String(),
 		)
 		return true
 	}
-
 	return false
+}
+
+// handleFailedRecords processes any failed records for a table
+func (m *migrationRunner) handleFailedRecords() error {
+	m.failedRecords.Range(func(key, value interface{}) bool {
+		tableName := key.(string)
+		records := value.([]map[string]any)
+		if len(records) > 0 {
+			logger.Sugar.Infof("Table %s had %d failed records", tableName, len(records))
+
+			// Write to file
+			failedRecordsFile := fmt.Sprintf("%s_failed_records.json", tableName)
+			data, err := json.MarshalIndent(records, "", "  ")
+			if err != nil {
+				logger.Sugar.Errorf("Failed to marshal failed records for table %s: %v", tableName, err)
+				return true
+			}
+			err = os.WriteFile(failedRecordsFile, data, 0644)
+			if err != nil {
+				logger.Sugar.Errorf("Failed to save failed records for table %s: %v", tableName, err)
+			}
+		}
+		return true
+	})
+
+	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"migration-tool-go/dtos/common"
 	"migration-tool-go/dtos/destinations/doris"
+	"migration-tool-go/dtos/destinations/kafka"
 	"migration-tool-go/dtos/sources/postgres"
 	"migration-tool-go/logger"
 	"os"
@@ -76,6 +77,13 @@ func InitializeConfig(configPath string) {
 		destination := doris.Doris{}
 		if err := json.Unmarshal(destType.Value, &destination); err != nil {
 			logger.Sugar.Fatalf("Error parsing common.Destination[doris.Doris]: %v", err)
+		}
+		DestinationConfig.Type = destType.Type
+		DestinationConfig.Value = destination
+	case "kafka":
+		destination := kafka.Kafka{}
+		if err := json.Unmarshal(destType.Value, &destination); err != nil {
+			logger.Sugar.Fatalf("Error parsing common.Destination[kafka.Kafka]: %v", err)
 		}
 		DestinationConfig.Type = destType.Type
 		DestinationConfig.Value = destination
