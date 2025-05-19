@@ -35,6 +35,8 @@ type kafkaConnector struct {
 	processingDone    atomic.Bool
 	successChan       chan *sarama.ProducerMessage
 	errorChan         chan *sarama.ProducerError
+	monitorCancel     context.CancelFunc
+	monitorCtxCancel  context.CancelFunc
 }
 
 type kafkaWorker struct {
@@ -51,13 +53,13 @@ func (k *kafkaConnector) Initialize(ctx context.Context, tableInfo *dtos.TableIn
 	k.processedRecords = recordsProcessedTracker
 	k.recordsProcessed.Store(0)
 	k.processingDone.Store(false)
-	
+
 	// Create a buffered channel for batching records
 	k.recordQueue = make(chan []map[string]any, 100)
-	
+
 	// Initialize workers
 	k.workers = make([]*kafkaWorker, 0, k.workerCount)
-	
+
 	// Start worker goroutines
 	k.wg.Add(k.workerCount)
 	for i := 0; i < k.workerCount; i++ {
@@ -66,56 +68,56 @@ func (k *kafkaConnector) Initialize(ctx context.Context, tableInfo *dtos.TableIn
 			connector: k,
 		}
 		k.workers = append(k.workers, worker)
-		
+
 		// Start the worker goroutine
 		go func(w *kafkaWorker) {
 			defer k.wg.Done()
 			logger.Sugar.Infof("Starting worker %d", w.id)
-			
+
 			for batch := range k.recordQueue {
 				if batch == nil {
 					logger.Sugar.Infof("Worker %d received nil batch, exiting", w.id)
 					return
 				}
-				
+
 				logger.Sugar.Infof("Worker %d processing batch of %d records", w.id, len(batch))
-				
+
 				// Convert records to Kafka messages
 				messages, err := w.convertToKafkaMessages(batch)
 				if err != nil {
 					logger.Sugar.Errorf("❌ Worker %d failed to convert records to Kafka messages: %v", w.id, err)
 					continue
 				}
-				
+
 				// Send messages to Kafka
 				if err := w.sendMessagesWithRetry(messages); err != nil {
 					logger.Sugar.Errorf("❌ Worker %d failed to send messages: %v", w.id, err)
-					
+
 					// Track failed records
 					w.failedRecordsMu.Lock()
 					w.failedRecords = append(w.failedRecords, batch...)
 					w.failedRecordsMu.Unlock()
 				}
 			}
-			
+
 			logger.Sugar.Infof("Worker %d finished processing", w.id)
 		}(worker)
 	}
-	
+
 	logger.Sugar.Infof("Kafka connector initialized with %d workers and batch size %d", k.workerCount, k.batchSize)
 }
 
 // ProcessRecords processes records from the channel
 func (k *kafkaConnector) ProcessRecords(ctx context.Context, recordsChan <-chan map[string]any) {
 	logger.Sugar.Infof("Starting to process records for Kafka connector")
-	
+
 	// Process records from the channel
 	var batch []map[string]any
 	batchTimer := time.NewTimer(5 * time.Second)
 	defer batchTimer.Stop()
-	
+
 	logger.Sugar.Info("Starting to receive records from channel")
-	
+
 	for {
 		select {
 		case record, ok := <-recordsChan:
@@ -126,14 +128,28 @@ func (k *kafkaConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 					logger.Sugar.Infof("Sending final batch of %d records", len(batch))
 					k.recordQueue <- batch
 				}
+
+				// Close the record queue to signal workers to finish
 				close(k.recordQueue)
+
+				// Wait for all workers to finish processing
+				logger.Sugar.Info("Waiting for all workers to finish processing...")
+				k.wg.Wait()
+
+				// Set processing done flag
 				k.processingDone.Store(true)
-				logger.Sugar.Info("All records have been queued for processing")
+
+				// Log completion statistics
+				totalProcessed := k.GetProcessedCount()
+				totalRecordsRead := k.tableInfo.GetTotalRecordsRead()
+				logger.Sugar.Infof("All records have been processed. Processed: %d, Total Read: %d",
+					totalProcessed, totalRecordsRead)
+
 				return
 			}
-			
+
 			batch = append(batch, record)
-			
+
 			// If we've reached the batch size, send the batch
 			if len(batch) >= k.batchSize {
 				logger.Sugar.Infof("Batch size reached (%d), sending batch", len(batch))
@@ -141,7 +157,7 @@ func (k *kafkaConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 				batch = make([]map[string]any, 0, k.batchSize)
 				batchTimer.Reset(5 * time.Second)
 			}
-			
+
 		case <-batchTimer.C:
 			// Time-based batching - send whatever we have after timeout
 			if len(batch) > 0 {
@@ -150,7 +166,7 @@ func (k *kafkaConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 				batch = make([]map[string]any, 0, k.batchSize)
 			}
 			batchTimer.Reset(5 * time.Second)
-			
+
 		case <-ctx.Done():
 			// Context canceled, send any remaining records
 			logger.Sugar.Info("Context canceled, sending remaining records")
@@ -158,8 +174,25 @@ func (k *kafkaConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 				logger.Sugar.Infof("Sending final batch of %d records due to context cancellation", len(batch))
 				k.recordQueue <- batch
 			}
+
+			// Close the record queue to signal workers to finish
 			close(k.recordQueue)
-			time.Sleep(5 * time.Second)
+
+			// Wait for workers to finish with a timeout
+			waitCh := make(chan struct{})
+			go func() {
+				k.wg.Wait()
+				close(waitCh)
+			}()
+
+			select {
+			case <-waitCh:
+				logger.Sugar.Info("All workers finished processing after context cancellation")
+			case <-time.After(10 * time.Second):
+				logger.Sugar.Warn("Timed out waiting for workers to finish after context cancellation")
+			}
+
+			// Set processing done flag
 			k.processingDone.Store(true)
 			logger.Sugar.Info("Processing done due to context cancellation")
 			return
@@ -167,59 +200,48 @@ func (k *kafkaConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 	}
 }
 
-// Close closes the Kafka connector and releases resources
+// Close closes the Kafka connector and releases all resources
 func (k *kafkaConnector) Close() error {
 	logger.Sugar.Info("Closing Kafka connector...")
 
-	// Signal all workers to stop by closing the record queue
-	// This should already be closed by ProcessRecords when the channel is closed
-	// but we'll check if it's still open just to be safe
-	select {
-	case _, ok := <-k.recordQueue:
-		if ok {
-			// Queue is still open, close it
-			close(k.recordQueue)
-		}
-	default:
-		// Queue might be empty but still open
-		select {
-		case k.recordQueue <- nil:
-			// Queue is still open, close it
-			close(k.recordQueue)
-		default:
-			// Queue is likely closed
-		}
+	// Cancel the monitoring context to stop all monitoring goroutines
+	if k.monitorCtxCancel != nil {
+		logger.Sugar.Info("Cancelling monitoring context")
+		k.monitorCtxCancel()
 	}
 
-	// Wait with timeout for all workers to finish
-	waitChan := make(chan struct{})
-	go func() {
-		k.wg.Wait()
-		close(waitChan)
-	}()
-
-	// Wait for workers to finish or timeout after 5 seconds
-	select {
-	case <-waitChan:
-		logger.Sugar.Info("All Kafka workers finished")
-	case <-time.After(5 * time.Second):
-		logger.Sugar.Warn("Timed out waiting for Kafka workers to finish")
-	}
-
-	// Close the Kafka producer
+	// Close the producer if it exists
 	if k.producer != nil {
-		logger.Sugar.Info("Closing Kafka producer...")
+		logger.Sugar.Info("Closing Kafka producer")
 		if err := k.producer.Close(); err != nil {
 			logger.Sugar.Errorf("Error closing Kafka producer: %v", err)
 			return err
 		}
 	}
 
-	// Close channels
-	close(k.successChan)
-	close(k.errorChan)
+	// Wait for any remaining worker goroutines to finish
+	logger.Sugar.Info("Waiting for worker goroutines to finish")
+	done := make(chan struct{})
+	go func() {
+		k.wg.Wait()
+		close(done)
+	}()
 
-	logger.Sugar.Info("Kafka connector closed")
+	// Wait for workers to finish with a timeout
+	select {
+	case <-done:
+		logger.Sugar.Info("All worker goroutines finished")
+	case <-time.After(5 * time.Second):
+		logger.Sugar.Warn("Timed out waiting for worker goroutines to finish")
+	}
+
+	// Set processing done flag if not already set
+	if !k.processingDone.Load() {
+		logger.Sugar.Info("Setting processing done flag")
+		k.processingDone.Store(true)
+	}
+
+	logger.Sugar.Info("Kafka connector closed successfully")
 	return nil
 }
 
@@ -246,17 +268,44 @@ func (k *kafkaConnector) GetFailedRecords() []map[string]any {
 func (k *kafkaConnector) IsProcessingDone() bool {
 	// Check if processing is done and all workers have finished
 	if !k.processingDone.Load() {
+		// Perform an additional check to see if we should consider processing done
+		// This helps when all records have been processed but the processingDone flag hasn't been set yet
+		if k.tableInfo != nil && k.tableInfo.ReadingRecordsDone.Load().(bool) {
+			totalProcessed := k.GetProcessedCount()
+			totalFailedRecords := uint64(len(k.GetFailedRecords()))
+			totalRecordsRead := k.tableInfo.GetTotalRecordsRead()
+
+			// If we've processed all records that were read, we can consider processing done
+			// This is a safety check in case the channel closing logic didn't work properly
+			if totalRecordsRead > 0 && (totalProcessed+totalFailedRecords) >= totalRecordsRead {
+				logger.Sugar.Infof("All records processed despite processingDone flag not set - Processed: %d, Failed: %d, Total Read: %d",
+					totalProcessed, totalFailedRecords, totalRecordsRead)
+
+				// Set the processing done flag since we've determined all records are processed
+				k.processingDone.Store(true)
+				return true
+			}
+		}
 		return false
 	}
 
 	// Additional check: ensure all records in the queue have been processed
 	// This is a more comprehensive check than just relying on the processingDone flag
-	if k.tableInfo.ReadingRecordsDone.Load().(bool) {
+	if k.tableInfo != nil && k.tableInfo.ReadingRecordsDone.Load().(bool) {
 		totalProcessed := k.GetProcessedCount()
 		totalFailedRecords := uint64(len(k.GetFailedRecords()))
+		totalRecordsRead := k.tableInfo.GetTotalRecordsRead()
 
-		// If we've processed all records (including failures), we're done
-		return (totalProcessed + totalFailedRecords) >= k.tableInfo.GetTotalRecordsRead()
+		// Log the current state for debugging
+		logger.Sugar.Infof("IsProcessingDone check - Processed: %d, Failed: %d, Total Read: %d",
+			totalProcessed, totalFailedRecords, totalRecordsRead)
+
+		// Check if we've processed all records (including failures)
+		if (totalProcessed + totalFailedRecords) >= totalRecordsRead {
+			logger.Sugar.Infof("All records processed - Processed: %d, Failed: %d, Total Read: %d",
+				totalProcessed, totalFailedRecords, totalRecordsRead)
+			return true
+		}
 	}
 
 	return false
@@ -353,19 +402,23 @@ func (w *kafkaWorker) addFailedRecords(records []map[string]any) {
 
 func (w *kafkaWorker) sendMessagesWithRetry(messages []*sarama.ProducerMessage) error {
 	st := time.Now()
-	
+
 	// No need for mutex with async producer since it's thread-safe
 	for _, msg := range messages {
 		// Send message to the async producer
 		w.connector.producer.Input() <- msg
 	}
-	
+
 	// Increment processed count at the connector level - this is critical for IsProcessingDone to work correctly
-	w.connector.recordsProcessed.Add(uint64(len(messages)))
-	
+	count := uint64(len(messages))
+	w.connector.recordsProcessed.Add(count)
+
+	// Also update the tableInfo totalRecordsProcessed counter - this is critical for the migration runner to know when all records are processed
+	w.connector.tableInfo.IncrementTotalRecordsProcessed(count)
+
 	// Also update the worker's processed count
-	w.processedCount.Add(uint64(len(messages)))
-	
+	w.processedCount.Add(count)
+
 	logger.Sugar.Infof("✅ Worker %d sent %d messages in %v", w.id, len(messages), time.Since(st))
 	return nil
 }
@@ -402,13 +455,13 @@ func NewKafkaConnector(destination common.Destination[any]) {
 	producerConfig.Producer.Retry.Max = 10
 	producerConfig.Producer.Return.Successes = true
 	producerConfig.Producer.Return.Errors = true
-	
+
 	// Performance optimizations
 	producerConfig.Producer.Flush.Frequency = time.Duration(kafkaConfig.Configuration.FlushFrequencyMs) * time.Millisecond
 	producerConfig.Producer.Flush.MaxMessages = kafkaConfig.Configuration.FlushMessages
 	producerConfig.Producer.Flush.Bytes = kafkaConfig.Configuration.FlushBytes
 	producerConfig.Producer.MaxMessageBytes = kafkaConfig.Configuration.MaxMessageBytes
-	
+
 	// Enable compression if configured
 	if kafkaConfig.Configuration.CompressionEnabled {
 		switch kafkaConfig.Configuration.CompressionType {
@@ -424,10 +477,10 @@ func NewKafkaConnector(destination common.Destination[any]) {
 			producerConfig.Producer.Compression = sarama.CompressionNone
 		}
 	}
-	
+
 	// Set batch size
 	producerConfig.Producer.Flush.Messages = kafkaConfig.Configuration.BatchSize
-	
+
 	// Set max open requests
 	producerConfig.Net.MaxOpenRequests = kafkaConfig.Configuration.MaxOpenRequests
 
@@ -461,12 +514,17 @@ func NewKafkaConnector(destination common.Destination[any]) {
 	successCount := uint64(0)
 	errorCount := uint64(0)
 
+	// Create a cancellable context for the monitoring goroutines
+	monitorCtx, monitorCtxCancel := context.WithCancel(context.Background())
+	KafkaConnector.monitorCtxCancel = monitorCtxCancel
+
 	// Start goroutines to handle success and error channels
 	go func() {
 		for msg := range producer.Successes() {
 			// Forward to our success channel without blocking
 			select {
 			case successChan <- msg:
+				// Message will be counted in the monitoring goroutine
 			default:
 				// Channel might be full, log directly and increment the counter anyway
 				atomic.AddUint64(&successCount, 1)
@@ -482,6 +540,7 @@ func NewKafkaConnector(destination common.Destination[any]) {
 			// Forward to our error channel without blocking
 			select {
 			case errorChan <- err:
+				// Error will be counted in the monitoring goroutine
 			default:
 				// Channel might be full, log directly
 				logger.Sugar.Errorf("Kafka producer error: %v", err.Err)
@@ -505,13 +564,24 @@ func NewKafkaConnector(destination common.Destination[any]) {
 			case <-ticker.C:
 				currentSuccess := atomic.LoadUint64(&successCount)
 				currentErrors := atomic.LoadUint64(&errorCount)
-				
+				totalProcessed := KafkaConnector.recordsProcessed.Load()
+
 				if currentSuccess > 0 || currentErrors > 0 {
-					logger.Sugar.Infof("Kafka producer stats - Success: %d, Errors: %d, Total processed: %d", 
-						currentSuccess, 
+					// Sanity check: success count should never exceed processed count
+					if currentSuccess > totalProcessed {
+						logger.Sugar.Warnf("Success count (%d) exceeds total processed count (%d), capping at total processed",
+							currentSuccess, totalProcessed)
+						// Cap the success count at the total processed count
+						currentSuccess = totalProcessed
+					}
+
+					logger.Sugar.Infof("Kafka producer stats - Success: %d, Errors: %d, Total processed: %d",
+						currentSuccess,
 						currentErrors,
-						KafkaConnector.recordsProcessed.Load())
+						totalProcessed)
 				}
+			case <-monitorCtx.Done():
+				return
 			}
 		}
 	}()

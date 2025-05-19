@@ -99,6 +99,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Explicitly close all connectors to ensure proper shutdown
+	logger.Sugar.Info("Shutting down services...")
+	
+	// Close Kafka connector if it exists
+	if services.KafkaConnector != nil {
+		if err := services.KafkaConnector.Close(); err != nil {
+			logger.Sugar.Errorf("Error closing Kafka connector: %v", err)
+		}
+	}
+	
+	// Close Doris connector if it exists
+	if services.DorisConnector != nil {
+		if err := services.DorisConnector.Close(); err != nil {
+			logger.Sugar.Errorf("Error closing Doris connector: %v", err)
+		}
+	}
+	
+	// Force exit after a short delay if the application doesn't exit naturally
+	go func() {
+		logger.Sugar.Info("Waiting 3 seconds for graceful shutdown before forcing exit...")
+		time.Sleep(3 * time.Second)
+		logger.Sugar.Warn("Forcing application exit")
+		os.Exit(0)
+	}()
+
 	// Report completion
 	logger.Sugar.Infof("Migration completed successfully in %s", time.Since(startTime))
 }

@@ -119,6 +119,14 @@ func (m *migrationRunner) Run(ctx context.Context) error {
 		// Save failed records to files for later analysis or retry
 		m.handleFailedRecords()
 	}
+	
+	// Force exit the application after a short delay to ensure logs are flushed
+	go func() {
+		logger.Sugar.Info("All records processed, exiting application in 3 seconds...")
+		time.Sleep(3 * time.Second)
+		logger.Sugar.Info("Exiting application")
+		os.Exit(0)
+	}()
 
 	return nil
 }
@@ -248,16 +256,24 @@ func (m *migrationRunner) checkTableProcessed(infoChan *dtos.TableInfoChan, chec
 		}
 	}
 
+	// Log the current state for debugging
+	totalProcessed := infoChan.GetTotalRecordsProcessed()
+	totalRead := infoChan.GetTotalRecordsRead()
+	readingDone := infoChan.ReadingRecordsDone.Load().(bool)
+	
+	logger.Sugar.Infof("Check processing status - Table: %s, Reading Done: %v, Processed: %d, Failed: %d, Total Read: %d",
+		infoChan.TableInfo.TableName, readingDone, totalProcessed, totalFailedRecords, totalRead)
+
 	// If we've read all records and processed all of them (including failures), we're done with this table
-	if infoChan.ReadingRecordsDone.Load().(bool) && (infoChan.GetTotalRecordsProcessed()+uint64(totalFailedRecords)) >= infoChan.GetTotalRecordsRead() {
+	if readingDone && (totalProcessed+uint64(totalFailedRecords)) >= totalRead {
 		logger.Sugar.Infof("Migration for table %s completed, workers: %d, batch size: %d, batch timeout: %dms, total uuids read: %d, total records read: %d, total records processed: %d, failed records: %d, time taken: %s",
 			infoChan.TableInfo.TableName,
 			m.workerConfig.NoOfWorkers,
 			m.workerConfig.RecordBatchSize,
 			m.workerConfig.BatchProcessingTimeoutMs,
 			infoChan.GetTotalUuidsRead(),
-			infoChan.GetTotalRecordsRead(),
-			infoChan.GetTotalRecordsProcessed(),
+			totalRead,
+			totalProcessed,
 			totalFailedRecords,
 			time.Since(m.startTime).String(),
 		)

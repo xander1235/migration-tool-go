@@ -10,6 +10,7 @@ import (
 	"migration-tool-go/logger"
 	"migration-tool-go/repository"
 	"migration-tool-go/utils"
+	"os"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -29,7 +30,7 @@ type postgresMigration struct {
 	// Add semaphore for controlling concurrent operations
 	workerSemaphore *semaphore.Weighted
 	// Add channel capacity tracking
-	channelCapacity   int
+	channelCapacity    int
 	channelUtilization int64
 	lastUtilizationLog time.Time
 }
@@ -40,7 +41,7 @@ func NewPostgresMigration(source common.Source[any], workerConfig common.WorkerC
 		workerConfig:  workerConfig,
 		repo:          repository.NewRepo(config.NewConnection(source.Value.(postgres.Postgres), workerConfig.NoOfWorkers)),
 	}
-	
+
 	// Initialize the migration service
 	PostgresMigration.Init()
 	logger.Sugar.Info("PostgreSQL migration service initialized")
@@ -54,8 +55,8 @@ func (p *postgresMigration) Init() {
 		p.channelCapacity = p.workerConfig.RecordBatchSize * 2 // Use record batch size as a basis for channel capacity
 	}
 	p.lastUtilizationLog = time.Now()
-	
-	logger.Sugar.Infof("Initialized PostgreSQL migration with %d workers and channel capacity of %d", 
+
+	logger.Sugar.Infof("Initialized PostgreSQL migration with %d workers and channel capacity of %d",
 		p.workerConfig.NoOfWorkers, p.channelCapacity)
 }
 
@@ -90,6 +91,8 @@ func (p postgresMigration) GetRecordsFromSource(ctx context.Context, tableInfoCh
 	wg.Wait()
 
 	*processedAllTables = true
+	// Close the tableInfoChan channel to signal that all tables have been processed
+	close(tableInfoChan)
 
 	return nil
 }
@@ -206,6 +209,18 @@ func (p postgresMigration) processRangeStrategy(ctx context.Context, tableInfoCh
 		return
 	}
 
+	// Check if we have valid ranges
+	if len(ranges) <= 1 {
+		logger.Sugar.Warnf("No valid ranges generated for table %s", tableInfoChan.TableInfo.TableName)
+		// Mark reading as done and close the records channel to signal completion
+		tableInfoChan.ReadingIdsDone.Store(true)
+		tableInfoChan.ReadingRecordsDone.Store(true)
+		// Close the records channel to signal that no more records will be sent
+		close(tableInfoChan.RecordsChan)
+		logger.Sugar.Infof("No records to process for table %s, migration will exit", tableInfoChan.TableInfo.TableName)
+		return
+	}
+
 	// Send ranges to the channel
 	for i := 0; i < len(ranges)-1; i++ {
 		tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{
@@ -221,7 +236,19 @@ func (p postgresMigration) processRangeStrategy(ctx context.Context, tableInfoCh
 // processFixedValuesStrategy processes a table using fixed values
 func (p *postgresMigration) processFixedValuesStrategy(ctx context.Context, tableInfoChan *dtos.TableInfoChan, strategy *postgres.QueryStrategy) {
 	logger.Sugar.Infof("Processing table %s using fixed values strategy on column %s", tableInfoChan.TableInfo.TableName, strategy.Column)
-	
+
+	// Check if we have valid fixed values
+	if len(strategy.FixedValuesParams.Values) == 0 {
+		logger.Sugar.Warnf("No valid fixed values provided for table %s", tableInfoChan.TableInfo.TableName)
+		// Mark reading as done and close the records channel to signal completion
+		tableInfoChan.ReadingIdsDone.Store(true)
+		tableInfoChan.ReadingRecordsDone.Store(true)
+		// Close the records channel to signal that no more records will be sent
+		close(tableInfoChan.RecordsChan)
+		logger.Sugar.Infof("No records to process for table %s, migration will exit", tableInfoChan.TableInfo.TableName)
+		return
+	}
+
 	// Send each fixed value as a separate range
 	for _, value := range strategy.FixedValuesParams.Values {
 		tableInfoChan.PrimaryKeyRange <- dtos.PrimaryKeyRange{
@@ -229,7 +256,7 @@ func (p *postgresMigration) processFixedValuesStrategy(ctx context.Context, tabl
 			IdRange: [2]any{value, value},
 		}
 	}
-	
+
 	// Close the channel to signal no more ranges
 	close(tableInfoChan.PrimaryKeyRange)
 	tableInfoChan.ReadingIdsDone.Store(true)
@@ -272,6 +299,23 @@ func (p postgresMigration) processTimeWindowStrategy(ctx context.Context, tableI
 	if err != nil {
 		logger.Sugar.Errorf("Failed to generate time windows: %v", err)
 		tableInfoChan.ReadingIdsDone.Store(true)
+		return
+	}
+
+	// Check if we have valid time windows
+	if len(timeWindows) <= 1 {
+		logger.Sugar.Warnf("No valid time windows generated for table %s. Start time and end time might be identical or too close.", tableInfoChan.TableInfo.TableName)
+		// Mark reading as done and close the records channel to signal completion
+		tableInfoChan.ReadingIdsDone.Store(true)
+		tableInfoChan.ReadingRecordsDone.Store(true)
+		// Close the records channel to signal that no more records will be sent
+		close(tableInfoChan.RecordsChan)
+		logger.Sugar.Infof("No records to process for table %s, migration will exit", tableInfoChan.TableInfo.TableName)
+
+		// Force exit the application since there are no records to process
+		logger.Sugar.Info("No records to process, forcing application exit")
+		os.Exit(0)
+
 		return
 	}
 
@@ -346,12 +390,12 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 
 	// Track channel backpressure
 	backpressureStartTime := time.Time{}
-	
+
 	// Start a goroutine to periodically log channel utilization
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ticker.C:
@@ -359,13 +403,13 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 				capacity := cap(infoChan.RecordsChan)
 				used := len(infoChan.RecordsChan)
 				utilization := float64(used) / float64(capacity) * 100
-				
-				logger.Sugar.Infof("Channel utilization: %.2f%% (%d/%d)", 
+
+				logger.Sugar.Infof("Channel utilization: %.2f%% (%d/%d)",
 					utilization, used, capacity)
-					
+
 				// If channel is getting full, log a warning
 				if utilization > 80 {
-					logger.Sugar.Warnf("High channel utilization (%.2f%%), possible backpressure", 
+					logger.Sugar.Warnf("High channel utilization (%.2f%%), possible backpressure",
 						utilization)
 				}
 			case <-ctx.Done():
@@ -374,7 +418,7 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 		}
 	}()
 
-	for {
+	for !processingDone {
 		select {
 		case primaryKeyRange := <-infoChan.PrimaryKeyRange:
 			// Check memory usage before processing
@@ -407,20 +451,20 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 			channelCap := cap(infoChan.RecordsChan)
 			channelLen := len(infoChan.RecordsChan)
 			channelUtilization := float64(channelLen) / float64(channelCap) * 100
-			
+
 			// If channel is more than 80% full, implement backpressure handling
 			if channelUtilization > 80 {
 				if backpressureStartTime.IsZero() {
 					// First time we're seeing backpressure
 					backpressureStartTime = time.Now()
-					logger.Sugar.Warnf("Channel backpressure detected: %.2f%% full (%d/%d)", 
+					logger.Sugar.Warnf("Channel backpressure detected: %.2f%% full (%d/%d)",
 						channelUtilization, channelLen, channelCap)
 				} else if time.Since(backpressureStartTime) > 30*time.Second {
 					// Sustained backpressure for more than 30 seconds
-					logger.Sugar.Warnf("Sustained channel backpressure for %v: %.2f%% full (%d/%d)", 
-						time.Since(backpressureStartTime).Round(time.Second), 
+					logger.Sugar.Warnf("Sustained channel backpressure for %v: %.2f%% full (%d/%d)",
+						time.Since(backpressureStartTime).Round(time.Second),
 						channelUtilization, channelLen, channelCap)
-					
+
 					// Sleep to allow downstream processing to catch up
 					sleepTime := 500 * time.Millisecond
 					logger.Sugar.Infof("Pausing for %v to allow downstream processing to catch up", sleepTime)
@@ -513,6 +557,12 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 							records[i] = nil
 						}
 						records = nil
+
+						if infoChan.ReadingIdsDone.Load().(bool) && infoChan.GetTotalUuidsRead() == infoChan.GetTotalUuidsProcessed() {
+							infoChan.ReadingRecordsDone.Store(true)
+							processingDone = true
+							break
+						}
 					}
 				}
 
@@ -520,6 +570,11 @@ func (p postgresMigration) getRecordsFromPrimaryKeyRange(ctx context.Context, in
 		case <-ctx.Done():
 			processingDone = true
 			break
+
+		case <-time.After(5 * time.Second):
+			if processingDone {
+				break
+			}
 		}
 
 		if processingDone {
@@ -539,7 +594,7 @@ func (p *postgresMigration) sendRecordsWithRetry(ctx context.Context, records []
 		backoff := 10 * time.Millisecond
 		maxBackoff := 5 * time.Second
 		retryCount := 0
-		
+
 		for {
 			// Try to send the record to the channel
 			select {
@@ -554,10 +609,10 @@ func (p *postgresMigration) sendRecordsWithRetry(ctx context.Context, records []
 				// Channel is full, wait and retry with backoff
 				if retryCount == 0 || retryCount%10 == 0 {
 					// Log on first retry and every 10 retries after that
-					logger.Sugar.Warnf("Channel full, implementing backoff (attempt #%d, channel capacity: %d/%d)", 
+					logger.Sugar.Warnf("Channel full, implementing backoff (attempt #%d, channel capacity: %d/%d)",
 						retryCount+1, len(infoChan.RecordsChan), cap(infoChan.RecordsChan))
 				}
-				
+
 				// Wait with backoff before retrying
 				select {
 				case <-time.After(backoff):
@@ -567,7 +622,7 @@ func (p *postgresMigration) sendRecordsWithRetry(ctx context.Context, records []
 						backoff = maxBackoff
 					}
 					retryCount++
-					
+
 					// If we've been retrying for a long time, log a warning but NEVER drop the record
 					if retryCount > 0 && retryCount%50 == 0 {
 						logger.Sugar.Warnf("Still trying to send record after %d attempts. Will continue until successful.", retryCount)
@@ -578,12 +633,12 @@ func (p *postgresMigration) sendRecordsWithRetry(ctx context.Context, records []
 				}
 			}
 		}
-		
+
 	nextRecord:
 		// Record successfully sent or context cancelled
 		continue
 	}
-	
+
 	// Log successful completion
 	logger.Sugar.Infof("Successfully sent all %d records", len(records))
 }
@@ -712,6 +767,14 @@ func (p postgresMigration) GenerateTimeWindows(startTime, endTime any, windowSiz
 		}
 	default:
 		return nil, fmt.Errorf("unsupported end time type: %T", endTime)
+	}
+
+	// Check if start and end times are identical
+	if start.Equal(end) {
+		logger.Sugar.Warnf("Start time and end time are identical: %v", start)
+		// Return a minimal valid window list with just the start time
+		// This will result in no ranges being processed, which is the expected behavior
+		return []any{start}, nil
 	}
 
 	// Convert windowSize to time.Duration
