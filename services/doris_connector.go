@@ -51,7 +51,7 @@ func (d *dorisConnector) Initialize(ctx context.Context, tableInfo *dtos.TableIn
 	d.batchSize = 10000 // Default batch size, can be configured
 	d.workerCount = 30  // Default worker count, can be configured
 	d.recordQueue = make(chan []map[string]any, 100)
-	
+
 	// Initialize workers
 	d.workers = make([]*dorisWorker, d.workerCount)
 	for i := 0; i < d.workerCount; i++ {
@@ -61,13 +61,13 @@ func (d *dorisConnector) Initialize(ctx context.Context, tableInfo *dtos.TableIn
 			failedRecords: make([]map[string]any, 0),
 		}
 	}
-	
+
 	// Start workers
 	for i := 0; i < d.workerCount; i++ {
 		d.wg.Add(1)
 		go d.workers[i].processRecords(ctx, &d.wg)
 	}
-	
+
 	logger.Sugar.Infof("Doris connector initialized with %d workers and batch size %d", d.workerCount, d.batchSize)
 }
 
@@ -76,7 +76,7 @@ func (d *dorisConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 	var batch []map[string]any
 	batchTimer := time.NewTimer(5 * time.Second)
 	defer batchTimer.Stop()
-	
+
 	for {
 		select {
 		case record, ok := <-recordsChan:
@@ -89,16 +89,16 @@ func (d *dorisConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 				d.processingDone.Store(true)
 				return
 			}
-			
+
 			batch = append(batch, record)
-			
+
 			// If we've reached the batch size, send the batch
 			if len(batch) >= d.batchSize {
 				d.recordQueue <- batch
 				batch = make([]map[string]any, 0, d.batchSize)
 				batchTimer.Reset(5 * time.Second)
 			}
-			
+
 		case <-batchTimer.C:
 			// Time-based batching - send whatever we have after timeout
 			if len(batch) > 0 {
@@ -106,7 +106,7 @@ func (d *dorisConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 				batch = make([]map[string]any, 0, d.batchSize)
 			}
 			batchTimer.Reset(5 * time.Second)
-			
+
 		case <-ctx.Done():
 			// Context canceled, send any remaining records
 			if len(batch) > 0 {
@@ -122,7 +122,7 @@ func (d *dorisConnector) ProcessRecords(ctx context.Context, recordsChan <-chan 
 // Close closes the Doris connector and releases resources
 func (d *dorisConnector) Close() error {
 	logger.Sugar.Info("Closing Doris connector...")
-	
+
 	// Signal all workers to stop by closing the record queue
 	// This should already be closed by ProcessRecords when the channel is closed
 	// but we'll check if it's still open just to be safe
@@ -142,14 +142,14 @@ func (d *dorisConnector) Close() error {
 			// Queue is likely closed
 		}
 	}
-	
+
 	// Wait with timeout for all workers to finish
 	waitChan := make(chan struct{})
 	go func() {
 		d.wg.Wait()
 		close(waitChan)
 	}()
-	
+
 	// Wait for workers to finish or timeout after 5 seconds
 	select {
 	case <-waitChan:
@@ -157,7 +157,7 @@ func (d *dorisConnector) Close() error {
 	case <-time.After(5 * time.Second):
 		logger.Sugar.Warn("Timed out waiting for Doris workers to finish")
 	}
-	
+
 	logger.Sugar.Info("Doris connector closed")
 	return nil
 }
@@ -170,14 +170,14 @@ func (d *dorisConnector) GetProcessedCount() uint64 {
 // GetFailedRecords returns the records that failed to be processed
 func (d *dorisConnector) GetFailedRecords() []map[string]any {
 	var failedRecords []map[string]any
-	
+
 	// Collect failed records from all workers
 	for _, worker := range d.workers {
 		worker.failedRecordsMu.Lock()
 		failedRecords = append(failedRecords, worker.failedRecords...)
 		worker.failedRecordsMu.Unlock()
 	}
-	
+
 	return failedRecords
 }
 
@@ -187,17 +187,17 @@ func (d *dorisConnector) IsProcessingDone() bool {
 	if !d.processingDone.Load() {
 		return false
 	}
-	
+
 	// Additional check: ensure all records in the queue have been processed
 	// This is a more comprehensive check than just relying on the processingDone flag
 	if d.tableInfo.ReadingRecordsDone.Load().(bool) {
 		totalProcessed := d.GetProcessedCount()
 		totalFailedRecords := uint64(len(d.GetFailedRecords()))
-		
+
 		// If we've processed all records (including failures), we're done
 		return (totalProcessed + totalFailedRecords) >= d.tableInfo.GetTotalRecordsRead()
 	}
-	
+
 	return false
 }
 
@@ -205,7 +205,7 @@ func (d *dorisConnector) IsProcessingDone() bool {
 
 func (w *dorisWorker) processRecords(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	
+
 	for {
 		select {
 		case batch, ok := <-w.connector.recordQueue:
@@ -213,10 +213,10 @@ func (w *dorisWorker) processRecords(ctx context.Context, wg *sync.WaitGroup) {
 				// Queue closed, worker can exit
 				return
 			}
-			
+
 			// Process the batch
 			w.processBatch(batch)
-			
+
 		case <-ctx.Done():
 			return
 		}
@@ -227,10 +227,10 @@ func (w *dorisWorker) processBatch(records []map[string]any) {
 	if len(records) == 0 {
 		return
 	}
-	
+
 	// Generate a unique label for this batch
 	uniqueLabel := uuid.New().String()
-	
+
 	// Convert records to JSON
 	jsonData, err := utils.ConvertRecordsToJSON(records, "", false)
 	if err != nil {
@@ -240,28 +240,28 @@ func (w *dorisWorker) processBatch(records []map[string]any) {
 	}
 	
 	// Construct the Doris URL
-	beNodes := w.connector.connectionDetails.BeNodes
-	bePort := w.connector.connectionDetails.BePort
+	//beNodes := w.connector.connectionDetails.BeNodes
+	//bePort := w.connector.connectionDetails.BePort
 	database := w.connector.connectionDetails.Database
 	tableName := w.connector.tableInfo.TableInfo.TableName
-	
-	dorisURL := fmt.Sprintf("http://%s:%d/api/%s/%s/_stream_load", beNodes, bePort, database, tableName)
-	
+
+	dorisURL := fmt.Sprintf("http://%s:%d/api/%s/%s/_stream_load", w.connector.connectionDetails.FeNodes, w.connector.connectionDetails.FePort, database, tableName)
+
 	// Send the data to Doris with retry
 	err = w.streamLoadDoris(dorisURL, w.connector.connectionDetails.Username, w.connector.connectionDetails.Password, jsonData, uniqueLabel, uint64(len(records)))
-	
+
 	if err != nil {
 		logger.Sugar.Errorf("Worker %d failed to stream load to Doris: %v", w.id, err)
 		w.addFailedRecords(records)
 		return
 	}
-	
+
 	// Update processed count
 	count := uint64(len(records))
 	w.processedCount.Add(count)
 	w.connector.recordsProcessed.Add(count)
 	w.connector.tableInfo.IncrementTotalRecordsProcessed(count)
-	
+
 	// Update the processed records map
 	currentCount, _ := w.connector.processedRecords.LoadOrStore(uniqueLabel, uint64(0))
 	w.connector.processedRecords.Store(uniqueLabel, currentCount.(uint64)+count)
@@ -280,16 +280,16 @@ func (w *dorisWorker) streamLoadDoris(dorisURL, username, password string, jsonD
 	maxBackoff := 30 * time.Second
 	backoff := initialBackoff
 	attempt := 1
-	
+
 	for {
 		st := time.Now()
 		success := false
 		var responseStatus string
 		var responseBody string
-		
+
 		// Acquire the lock before sending to Doris
 		w.connector.dorisClientMutex.Lock()
-		
+
 		// Create HTTP request
 		req, err := http.NewRequest("PUT", dorisURL, bytes.NewReader(jsonData))
 		if err != nil {
@@ -303,7 +303,7 @@ func (w *dorisWorker) streamLoadDoris(dorisURL, username, password string, jsonD
 			req.Header.Set("label", uniqueLabel)        // Unique label
 			req.Header.Set("send_batch_parallelism", "10")
 			req.SetBasicAuth(username, password)
-			
+
 			// Send request with timeout
 			client := &http.Client{
 				Timeout: 5 * time.Minute, // Set a reasonable timeout
@@ -315,13 +315,13 @@ func (w *dorisWorker) streamLoadDoris(dorisURL, username, password string, jsonD
 				// Read response body
 				body, err := io.ReadAll(resp.Body)
 				resp.Body.Close() // Close body explicitly
-				
+
 				if err != nil {
 					logger.Sugar.Errorf("Worker %d failed to read response body (attempt %d): %v", w.id, attempt, err)
 				} else {
 					responseStatus = resp.Status
 					responseBody = string(body)
-					
+
 					// Check response status
 					if resp.StatusCode == http.StatusOK {
 						// Success!
@@ -335,14 +335,14 @@ func (w *dorisWorker) streamLoadDoris(dorisURL, username, password string, jsonD
 				}
 			}
 		}
-		
+
 		// Release the lock after sending to Doris
 		w.connector.dorisClientMutex.Unlock()
-		
+
 		if success {
 			return nil
 		}
-		
+
 		// Handle retry logic
 		// If we've reached max retries, continue retrying but log less frequently
 		if attempt >= maxRetries {
@@ -354,17 +354,17 @@ func (w *dorisWorker) streamLoadDoris(dorisURL, username, password string, jsonD
 			logger.Sugar.Warnf("Worker %d retrying (attempt %d/%d) for label %s with %d records after backoff of %v",
 				w.id, attempt, maxRetries, uniqueLabel, noOfRecords, backoff)
 		}
-		
+
 		// Wait before retrying
 		time.Sleep(backoff)
-		
+
 		// Increase backoff for next retry with exponential backoff and jitter
 		jitter := time.Duration(float64(backoff) * 0.1 * (0.5 + rand.Float64())) // 10% jitter
 		backoff = time.Duration(float64(backoff)*1.5) + jitter
 		if backoff > maxBackoff {
 			backoff = maxBackoff
 		}
-		
+
 		attempt++
 		// No maximum retry limit - we'll keep trying until successful
 	}

@@ -71,6 +71,20 @@ The tool uses a JSON configuration file with the following sections:
     "configuration": {
       "schemas": ["schema1", "schema2"],
       "excluded_schemas": ["public"],
+      "include_tables_list": [
+        {
+          "schema": "schema1",
+          "tables": ["table1", "table2"],
+          "query_strategy": {
+            "type": "batch_size",
+            "column": "id",
+            "batch_size_params": {
+              "batch_size": 10000,
+              "start_id": 1
+            }
+          }
+        }
+      ],
       "exclude_table_regex_list": [
         {
           "schema": "schema1",
@@ -89,7 +103,157 @@ The tool uses a JSON configuration file with the following sections:
 }
 ```
 
-### Destination Configuration (Apache Doris)
+#### Source Configuration Fields
+
+**Connection Details:**
+- `host`: The hostname or IP address of the PostgreSQL server
+- `port`: The port number PostgreSQL is running on (default: 5432)
+- `username`: Username for authentication
+- `password`: Password for authentication
+- `database`: Name of the database to connect to
+
+**Configuration Options:**
+- `schemas`: List of schemas to include in the migration (mutually exclusive with `include_tables_list`)
+- `excluded_schemas`: List of schemas to exclude from the migration
+- `include_tables_list`: Explicitly specify which tables to include in the migration
+  - `schema`: The schema containing the tables
+  - `tables`: List of table names to include
+  - `query_strategy`: Configuration for how to query the data (see Query Strategies section below)
+- `exclude_table_regex_list`: Exclude tables matching the specified regex patterns
+  - `schema`: The schema containing the tables
+  - `regex`: List of regex patterns to match against table names
+- `exclude_tables_list`: Explicitly exclude specific tables
+  - `schema`: The schema containing the tables
+  - `tables`: List of table names to exclude
+- `pool`: Maximum number of database connections in the connection pool
+
+#### Query Strategies
+
+The migration tool supports multiple query strategies to efficiently extract data from PostgreSQL tables. Each strategy is designed for different data distribution patterns and query requirements.
+
+##### 1. Batch Size Strategy
+
+**Type:** `batch_size`
+
+This strategy fetches data in fixed-size batches using OFFSET/LIMIT. It's simple but can be inefficient for large tables with many rows.
+
+**Mandatory Fields:**
+- `type`: Must be `"batch_size"`
+- `column`: The column to order by (typically the primary key)
+- `batch_size_params.batch_size`: Number of rows to fetch in each batch
+
+**Optional Fields:**
+- `batch_size_params.order_by`: Column to order by (defaults to the primary key)
+
+**Example:**
+```json
+"query_strategy": {
+  "type": "batch_size",
+  "column": "id",
+  "batch_size_params": {
+    "batch_size": 10000,
+    "order_by": "created_at"
+  }
+}
+```
+
+##### 2. Range Strategy
+
+**Type:** `range`
+
+This strategy divides the data into ranges based on a numeric or date column. It's efficient for evenly distributed data.
+
+**Mandatory Fields:**
+- `type`: Must be `"range"`
+- `column`: The column to base the ranges on
+- `range_params.frequency`: Step size for the range (e.g., `1000` for IDs or `'1 day'::interval` for timestamps)
+
+**Optional Fields:**
+- `range_params.min`: Minimum value to start from (default: MIN(column))
+- `range_params.max`: Maximum value to end at (default: MAX(column))
+
+**Example:**
+```json
+"query_strategy": {
+  "type": "range",
+  "column": "created_at",
+  "range_params": {
+    "frequency": "1 day",
+    "min": "2023-01-01T00:00:00",
+    "max": "2023-12-31T23:59:59"
+  }
+}
+```
+
+##### 3. Fixed Values Strategy
+
+**Type:** `fixed_values`
+
+This strategy fetches data for specific values of a column. Useful for partitioning data by a discrete set of values.
+
+**Mandatory Fields:**
+- `type`: Must be `"fixed_values"`
+- `column`: The column to filter on
+- `fixed_values_params.values`: Array of values to fetch data for
+- `fixed_values_params.batch_size`: Number of rows to fetch per batch
+
+**Example:**
+```json
+"query_strategy": {
+  "type": "fixed_values",
+  "column": "status",
+  "fixed_values_params": {
+    "values": ["active", "pending", "completed"],
+    "batch_size": 5000
+  }
+}
+```
+
+##### 4. Time Window Strategy
+
+**Type:** `time_window`
+
+This strategy is specifically designed for time-series data, dividing the data into fixed time windows.
+
+**Mandatory Fields:**
+- `type`: Must be `"time_window"`
+- `column`: The timestamp column to base the windows on
+- `time_window_params.window_size`: Size of each time window (e.g., "1h", "1d", "1w", "1m")
+
+**Optional Fields:**
+- `time_window_params.start_time`: Start time for the first window (ISO 8601 format)
+- `time_window_params.end_time`: End time for the last window (ISO 8601 format)
+
+**Example:**
+```json
+"query_strategy": {
+  "type": "time_window",
+  "column": "event_time",
+  "time_window_params": {
+    "window_size": "1 hour",
+    "start_time": "2023-01-01T00:00:00Z",
+    "end_time": "2023-01-02T00:00:00Z"
+  }
+}
+```
+
+#### Choosing the Right Strategy
+
+1. **Batch Size**: Simple but can be inefficient for large tables. Best for small to medium tables.
+2. **Range**: Good for numeric or date columns with even distribution. Efficient for large tables.
+3. **Fixed Values**: Best when you need to process specific values of a column.
+4. **Time Window**: Optimized for time-series data with timestamps.
+
+#### Notes
+
+- The `column` field is required for all strategies and should be indexed for best performance.
+- For time-based strategies, ensure the column is of a timestamp or date type.
+- The migration tool will automatically determine the min/max values if not specified.
+- For resuming failed migrations, the tool tracks progress and can continue from where it left off.
+
+### Destination Configuration
+
+#### Apache Doris
 
 ```json
 "destination": {
@@ -110,6 +274,102 @@ The tool uses a JSON configuration file with the following sections:
   }
 }
 ```
+
+##### Doris Configuration Fields
+
+**Connection Details:**
+- `fe_nodes`: Comma-separated list of Frontend (FE) node addresses
+- `fe_port`: Port for the FE HTTP server (default: 8030)
+- `be_nodes`: Comma-separated list of Backend (BE) node addresses
+- `be_port`: Port for the BE HTTP server (default: 8040)
+- `username`: Username for Doris authentication
+- `password`: Password for Doris authentication
+- `database`: Name of the target database in Doris
+
+**Configuration Options:**
+- `pool`: Maximum number of HTTP clients to use for parallel loading
+
+#### Apache Kafka
+
+```json
+"destination": {
+  "type": "kafka",
+  "value": {
+    "connection_details": {
+      "brokers": "kafka1:9092,kafka2:9092",
+      "username": "your-username",
+      "password": "your-password",
+      "use_sasl": true,
+      "use_tls": true,
+      "sasl_mechanism": "PLAIN",
+      "tls_skip_verify": false,
+      "client_cert_file": "/path/to/client.crt",
+      "client_key_file": "/path/to/client.key",
+      "ca_cert_file": "/path/to/ca.crt",
+      "warpstream_enabled": false
+    },
+    "configuration": {
+      "pool": 5,
+      "pool_size": 5,
+      "topic": "your-topic",
+      "batch_size": 1000,
+      "max_open_requests": 5,
+      "channel_buffer_size": 256,
+      "flush_bytes": 0,
+      "flush_messages": 0,
+      "flush_frequency_ms": 500,
+      "max_message_bytes": 1000000,
+      "compression_enabled": true,
+      "compression_type": "gzip",
+      "retry_max": 5,
+      "required_acks": "WaitForLocal"
+    }
+  }
+}
+```
+
+##### Kafka Configuration Fields
+
+**Connection Details:**
+- `brokers`: Comma-separated list of Kafka broker addresses (e.g., "kafka1:9092,kafka2:9092")
+- `username`: Username for SASL/PLAIN authentication
+- `password`: Password for SASL/PLAIN authentication
+- `use_sasl`: Enable SASL authentication (default: false)
+- `use_tls`: Enable TLS encryption (default: false)
+- `sasl_mechanism`: SASL mechanism to use (e.g., "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512")
+- `tls_skip_verify`: Skip TLS certificate verification (not recommended for production)
+- `client_cert_file`: Path to client certificate file for mutual TLS
+- `client_key_file`: Path to client private key file for mutual TLS
+- `ca_cert_file`: Path to CA certificate file
+- `warpstream_enabled`: Enable WarpStream compatibility mode (default: false)
+
+**Configuration Options:**
+- `pool`: Number of Kafka producer instances in the pool (legacy, use pool_size)
+- `pool_size`: Number of Kafka producer instances in the pool (recommended)
+- `topic`: Default topic to produce messages to (can be overridden per sync operation)
+- `batch_size`: Number of messages to batch together before sending (default: 1000)
+- `max_open_requests`: Maximum number of unacknowledged requests the client will send before blocking (default: 5)
+- `channel_buffer_size`: Size of the internal message queue (default: 256)
+- `flush_bytes`: Best-effort number of bytes needed to trigger a flush (0 = disabled)
+- `flush_messages`: Best-effort number of messages needed to trigger a flush (0 = disabled)
+- `flush_frequency_ms`: Best-effort frequency of flushes (default: 500ms)
+- `max_message_bytes`: Maximum permitted size of a message (default: 1,000,000 bytes)
+- `compression_enabled`: Enable message compression (default: false)
+- `compression_type`: Compression codec to use ("none", "gzip", "snappy", "lz4", "zstd")
+- `retry_max`: Maximum number of retries for a failing request (default: 5)
+- `required_acks`: Number of acknowledgements required ("NoResponse", "WaitForLocal", "WaitForAll")
+
+### Configuration Notes
+
+### Configuration Notes
+
+1. **Table Selection**: You can either specify tables to include using `include_tables_list` or specify schemas to include using `schemas`. These are mutually exclusive - if `include_tables_list` is provided, `schemas` will be ignored.
+
+2. **Batching Strategy**: The `query_strategy` in the source configuration allows you to control how data is read from PostgreSQL. The `batch_size` strategy is recommended for large tables as it processes data in smaller chunks to reduce memory usage.
+
+3. **Connection Pooling**: Both source and destination configurations support connection pooling. Adjust the `pool` values based on your server's capacity and the desired level of parallelism.
+
+4. **Exclusion Rules**: You can exclude tables using either regex patterns (`exclude_table_regex_list`) or explicit table lists (`exclude_tables_list`). These exclusions are applied after the initial table selection based on `schemas` or `include_tables_list`.
 
 ### Worker Configuration
 
